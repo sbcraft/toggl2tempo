@@ -57,7 +57,7 @@ class WorkLogsTableWidget(QWidget):
             # TODO: display datetimes without TZ
             row_content = [
                 wl.key,
-                wl.activity,
+                wl.activity if wl.activity is not None else "",
                 wl.description,
                 wl.startTime.strftime("%Y-%m-%d"),
                 "{0} - {1}".format(wl.startTime.strftime("%H:%M"), wl.endTime.strftime("%H:%M"))]

@@ -27,8 +27,6 @@ class WorkLog:
     @property
     def is_invalid(self):
         result = self.key is None \
-            or self.project is None \
-            or self.activity is None \
             or self.description is None \
             or self.duration <= 0
 

@@ -21,6 +21,7 @@ WorkLogCollection = List[WorkLog]
 class TempoClient(JiraClient):
 
     __tempo_legacy_rest_api_url = "https://api.tempo.io/core"
+    __tempo_rest_api_url = "https://api.tempo.io"
     __PAGE_SIZE = 50
 
     def __init__(self, jira_config: JiraConfig, tempo_config: TempoConfig):
@@ -38,7 +39,7 @@ class TempoClient(JiraClient):
         return True
 
     def get_worklogs(self, start_date: datetime, end_date: datetime) -> WorkLogCollection:
-        method_uri = self.__make_tempo_api_uri(f"worklogs/user/{self._user.account_id}")
+        method_uri = self.__make_tempo_api_uri("worklogs")
 
         page_index = 0
 
@@ -49,14 +50,16 @@ class TempoClient(JiraClient):
                 "from": start_date.strftime("%Y-%m-%d"),  # only dates, for instance "2016-12-23"
                 "to": end_date.strftime("%Y-%m-%d"),
                 "offset": page_index * self.__PAGE_SIZE,
-                "limit": self.__PAGE_SIZE
+                "limit": self.__PAGE_SIZE,
+                "userId": self._user.account_id
             }
 
             r = self.__session.get(url=method_uri, params=params)
             if r.status_code != HTTPStatus.OK:
+                full_url = f"{method_uri}?{urllib.parse.urlencode(params)}"
                 error_message = "{method_name}: url: {url} status {error_code}, error {error_message}".format(
                     method_name="get_worklogs",
-                    url=method_uri,
+                    url=full_url,
                     error_code=r.status_code,
                     error_message=r.text)
 
@@ -88,7 +91,13 @@ class TempoClient(JiraClient):
 
             # Common data
             wl.second_id = tempo_record["tempoWorklogId"]
-            wl.key = tempo_record["issue"]["key"]
+            # In v4.0, the issue key is not directly available, but we can use the issue id
+            if "issue" in tempo_record:
+                if "key" in tempo_record["issue"]:
+                    wl.key = tempo_record["issue"]["key"]
+                elif "id" in tempo_record["issue"]:
+                    # Store the issue ID temporarily - we may need to fetch the key separately
+                    wl.key = f"ISSUE-{tempo_record['issue']['id']}"
             wl.description = tempo_record["description"]
 
             # Times
@@ -101,7 +110,7 @@ class TempoClient(JiraClient):
             wl.duration = duration
 
             # Attributes
-            if tempo_record["attributes"] and tempo_record["attributes"]["values"]:
+            if "attributes" in tempo_record and "values" in tempo_record["attributes"] and tempo_record["attributes"]["values"]:
                 attributes = tempo_record["attributes"]["values"]
                 activity_attr = next((x for x in attributes if x["key"] == "_Activity_"), None)
                 if activity_attr is not None:
@@ -155,24 +164,66 @@ class TempoClient(JiraClient):
 
     def __worklog_to_dict(self, worklog: WorkLog) -> dict:
         data = {
-            "issueKey": worklog.key,
             "timeSpentSeconds": worklog.duration,
             "startDate": worklog.startTime.strftime("%Y-%m-%d"),
             "startTime": worklog.startTime.strftime("%H:%M:00"),
             "description": worklog.description,
             "authorAccountId": self._user.account_id,
-            "attributes": [
+        }
+
+        # Only include activity attribute if it's present
+        if worklog.activity is not None:
+            data["attributes"] = [
                 {
                     "key": "_Activity_",
                     # Tempo still required that attribute names should be encoded
                     "value": urllib.parse.quote(worklog.activity, safe='')
                 },
-            ],
-        }
+            ]
+
+        # Check if we have an issue ID format from our previous handling
+        if worklog.key and worklog.key.startswith("ISSUE-"):
+            # Extract the issue ID from our temporary format
+            issue_id = worklog.key.split("-", 1)[1]
+            data["issueId"] = int(issue_id)
+        elif worklog.key:
+            # We need to get the issue ID from the key
+            issue_id = self._get_issue_id_from_key(worklog.key)
+            if issue_id:
+                data["issueId"] = issue_id
+            else:
+                # Fallback to using issueKey - this might not work with newer Tempo API instances
+                # but might still work with installations that have v3 support
+                data["issueKey"] = worklog.key
+                logger.warning(f"Could not resolve issue ID for key {worklog.key}. Falling back to issueKey which may not work.")
+        else:
+            # No key available - this will likely fail
+            logger.error("No issue key available for worklog")
 
         return data
 
+    def _get_issue_id_from_key(self, issue_key):
+        """Get the Jira issue ID from the issue key using the Jira API"""
+        if not issue_key:
+            return None
+            
+        method_uri = self._make_jira_api_uri(f"issue/{issue_key}")
+        
+        # Use the JiraClient's session that already has authentication set up
+        r = self.get_session.get(url=method_uri)
+        
+        if r.status_code == HTTPStatus.OK:
+            issue_data = r.json()
+            return issue_data.get("id")
+        else:
+            logger.warning(f"Could not get issue ID for key {issue_key}: {r.status_code} - {r.text}")
+            return None
+
+    def _make_jira_api_uri(self, relative_url: str):
+        return "{0}/rest/api/3/{1}".format(self._JiraClient__config.host, relative_url)
+
     def __make_tempo_api_uri(self, relative_url: str):
-        return "{host}/3/{relative_url}".format(
-            host=self.__tempo_legacy_rest_api_url,
+        # Use the v4 API instead of v3
+        return "{host}/4/{relative_url}".format(
+            host=self.__tempo_rest_api_url,
             relative_url=relative_url)
